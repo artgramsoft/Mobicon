@@ -17,6 +17,7 @@ class Program
 
     private const int INPUT_KEYBOARD = 1;
     private const uint KEYEVENTF_KEYUP = 0x0002;
+    private const int LLKHF_INJECTED = 0x10;
 
     // Virtual Keys
     private const int VK_TAB = 0x09;
@@ -159,7 +160,7 @@ class Program
     }
 
     // State Variables
-    private const string Version = "v1.0.1";
+    private const string Version = "v1.0.2";
     private static LowLevelProc _kbHookProc = KeyboardHookCallback;
     private static LowLevelProc _mHookProc = MouseHookCallback;
     private static IntPtr _kbHook = IntPtr.Zero;
@@ -176,20 +177,16 @@ class Program
     private static uint _lastPid = 0;
     private static DateTime _lastCacheTime = DateTime.MinValue;
 
-    // Key tracking for safety release
-    private static readonly HashSet<int> _sentKeys = new();
+    // Key tracking
+    private static readonly HashSet<int> _sentMappedKeys = new();
+    private static readonly HashSet<int> _physicalKeysDown = new();
+    private static readonly object _stateLock = new();
 
     private static readonly Dictionary<int, int> KeyMap = new()
     {
-        { VK_A, VK_1 },
-        { VK_S, VK_2 },
-        { VK_D, VK_3 },
-        { VK_Q, VK_4 },
-        { VK_W, VK_5 },
-        { VK_E, VK_6 },
-        { VK_Z, VK_7 },
-        { VK_X, VK_8 },
-        { VK_C, VK_9 },
+        { VK_A, VK_1 }, { VK_S, VK_2 }, { VK_D, VK_3 },
+        { VK_Q, VK_4 }, { VK_W, VK_5 }, { VK_E, VK_6 },
+        { VK_Z, VK_7 }, { VK_X, VK_8 }, { VK_C, VK_9 },
         { VK_F, VK_0 }
     };
 
@@ -216,12 +213,11 @@ class Program
 
         UpdateStatus();
 
-        // Background thread to refresh status (periodically checks active state)
         Task.Run(async () =>
         {
             while (true)
             {
-                IsTargetActive(); // Keep _lastTargetActive updated
+                IsTargetActive(); 
                 await Task.Delay(500);
             }
         });
@@ -240,7 +236,6 @@ class Program
     private static void UpdateStatus()
     {
         bool active = _lastTargetActive;
-        
         string status = $" STATUS: [Process: {(active ? "ACTIVE  " : "INACTIVE")}] " +
                         $"[Combat: {(_combatMode ? "ON " : "OFF")}] " +
                         $"[Trigger: {(_triggerActive ? "ON " : "OFF")}] " +
@@ -250,22 +245,16 @@ class Program
         {
             int oldLeft = Console.CursorLeft;
             int oldTop = Console.CursorTop;
-
             Console.SetCursorPosition(0, 7);
-            
             if (active) Console.ForegroundColor = ConsoleColor.Green;
             else Console.ForegroundColor = ConsoleColor.Gray;
-
             if (_combatMode && active)
             {
                 if (_ctrlPressed) Console.ForegroundColor = ConsoleColor.Yellow;
                 else Console.ForegroundColor = ConsoleColor.Cyan;
             }
-
             Console.Write(status.PadRight(Console.WindowWidth - 1));
             Console.ResetColor();
-
-            // Restore cursor if it was in the log area
             if (oldTop > 7) Console.SetCursorPosition(oldLeft, oldTop);
             else Console.SetCursorPosition(0, 9);
         }
@@ -278,10 +267,7 @@ class Program
         {
             int oldLeft = Console.CursorLeft;
             int oldTop = Console.CursorTop;
-            
-            // Logs start from line 9
             if (oldTop < 9) Console.SetCursorPosition(0, 9);
-            
             Console.WriteLine($" [{DateTime.Now:HH:mm:ss}] {message}");
             UpdateStatus();
         }
@@ -293,7 +279,6 @@ class Program
         IntPtr fgWnd = GetForegroundWindow();
         if (fgWnd == IntPtr.Zero) return SetActiveState(false);
 
-        // Performance: Cache process name by HWnd
         string procName;
         if (fgWnd == _lastHWnd && (DateTime.Now - _lastCacheTime).TotalSeconds < 2)
         {
@@ -304,11 +289,7 @@ class Program
             GetWindowThreadProcessId(fgWnd, out uint pid);
             _lastHWnd = fgWnd;
             _lastPid = pid;
-            try
-            {
-                using var p = Process.GetProcessById((int)pid);
-                procName = p.ProcessName;
-            }
+            try { using var p = Process.GetProcessById((int)pid); procName = p.ProcessName; }
             catch { procName = ""; }
             _lastProcessName = procName;
             _lastCacheTime = DateTime.Now;
@@ -317,7 +298,6 @@ class Program
         bool isTargetProcess = procName.Equals("MabinogiMobile", StringComparison.OrdinalIgnoreCase);
         if (!isTargetProcess) return SetActiveState(false);
 
-        // Click-through prevention: Verify window under cursor belongs to target process
         bool isMouseOver = false;
         if (GetCursorPos(out POINT pt))
         {
@@ -325,10 +305,7 @@ class Program
             if (wndAtPt != IntPtr.Zero)
             {
                 GetWindowThreadProcessId(wndAtPt, out uint pidAtPt);
-                if (pidAtPt == _lastPid)
-                {
-                    isMouseOver = true;
-                }
+                if (pidAtPt == _lastPid) isMouseOver = true;
             }
         }
 
@@ -341,27 +318,23 @@ class Program
         {
             _lastTargetActive = active;
             // Log($"Active State: {(active ? "MATCH" : "NO MATCH")}");
-            
-            if (!active)
-            {
-                _triggerActive = false;
-                ReleaseAllKeys(); // Fix Key Sticking
-            }
+            if (!active) ResetAllStates();
             UpdateStatus();
         }
         return active;
     }
 
-    private static void ReleaseAllKeys()
+    private static void ResetAllStates()
     {
-        if (_sentKeys.Count == 0) return;
-        
-        var keys = _sentKeys.ToArray();
-        foreach (var vk in keys)
+        lock (_stateLock)
         {
-            SendKeyInternal((short)vk, true);
+            _triggerActive = false;
+            // Release any mapped keys (1-0)
+            foreach (var vk in _sentMappedKeys.ToArray()) SendKeyRaw((short)vk, true);
+            _sentMappedKeys.Clear();
+            // We don't clear _physicalKeysDown because they are still physically down,
+            // but we don't need to re-assert them when inactive.
         }
-        _sentKeys.Clear();
     }
 
     private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -369,50 +342,51 @@ class Program
         if (nCode >= 0)
         {
             var kbd = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+            // Skip injected events to avoid infinite loops
+            if ((kbd.flags & LLKHF_INJECTED) != 0) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+
             int vkCode = kbd.vkCode;
             int msg = wParam.ToInt32();
             bool isKeyDown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             bool isKeyUp = msg == WM_KEYUP || msg == WM_SYSKEYUP;
             
-            if (vkCode == VK_TAB && isKeyDown)
+            // Track physical state of mapping keys
+            if (KeyMap.ContainsKey(vkCode))
             {
-                if (IsTargetActive())
+                lock (_stateLock)
                 {
-                    _combatMode = !_combatMode;
-                    // Log($"Combat Mode: {(_combatMode ? "ON" : "OFF")}");
-                    if (!_combatMode) ReleaseAllKeys();
-                    UpdateStatus();
-                    return new IntPtr(1);
+                    if (isKeyDown) _physicalKeysDown.Add(vkCode);
+                    else if (isKeyUp) _physicalKeysDown.Remove(vkCode);
                 }
             }
 
-            if (!IsTargetActive())
+            if (vkCode == VK_TAB && isKeyDown && IsTargetActive())
             {
-                return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                _combatMode = !_combatMode;
+                // Log($"Combat Mode: {(_combatMode ? "ON" : "OFF")}");
+                ResetAllStates();
+                UpdateStatus();
+                return new IntPtr(1);
             }
+
+            if (!IsTargetActive()) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
 
             if (vkCode == VK_CONTROL || vkCode == VK_LCONTROL || vkCode == VK_RCONTROL)
             {
                 bool oldCtrl = _ctrlPressed;
                 if (isKeyDown) _ctrlPressed = true;
                 if (isKeyUp) _ctrlPressed = false;
-                if (oldCtrl != _ctrlPressed) 
-                {
-                    if (_ctrlPressed) ReleaseAllKeys();
-                    UpdateStatus();
-                }
+                if (oldCtrl != _ctrlPressed) { ResetAllStates(); UpdateStatus(); }
             }
 
-            bool effectivelyCombat = _combatMode && !_ctrlPressed;
-
-            if (effectivelyCombat && _triggerActive && KeyMap.ContainsKey(vkCode))
+            if (_combatMode && !_ctrlPressed && _triggerActive && KeyMap.ContainsKey(vkCode))
             {
-                if (isKeyDown) SendKeyInternal((short)KeyMap[vkCode], false);
-                else if (isKeyUp) SendKeyInternal((short)KeyMap[vkCode], true);
+                int mappedVk = KeyMap[vkCode];
+                if (isKeyDown) { lock (_stateLock) _sentMappedKeys.Add(mappedVk); SendKeyRaw((short)mappedVk, false); }
+                else if (isKeyUp) { lock (_stateLock) _sentMappedKeys.Remove(mappedVk); SendKeyRaw((short)mappedVk, true); }
                 return new IntPtr(1);
             }
         }
-
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
@@ -421,61 +395,45 @@ class Program
         if (nCode >= 0)
         {
             int msg = wParam.ToInt32();
-
-            if (!IsTargetActive())
-            {
-                return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
-            }
+            if (!IsTargetActive()) return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
 
             bool effectivelyCombat = _combatMode && !_ctrlPressed;
 
-            if (msg == WM_LBUTTONDOWN)
+            if (msg == WM_LBUTTONDOWN && effectivelyCombat)
             {
-                if (effectivelyCombat)
+                lock (_stateLock)
                 {
                     _triggerActive = true;
-                    UpdateStatus();
-                    return new IntPtr(1);
+                    // FIX: Release original keys that are physically held down
+                    foreach (var vk in _physicalKeysDown) SendKeyRaw((short)vk, true);
                 }
+                UpdateStatus();
+                return new IntPtr(1);
             }
             else if (msg == WM_LBUTTONUP)
             {
                 bool wasActive = _triggerActive;
-                _triggerActive = false;
-                if (effectivelyCombat || wasActive)
+                lock (_stateLock)
                 {
-                    ReleaseAllKeys();
-                    UpdateStatus();
-                    // If we intercepted the down, we must intercept the up
-                    return wasActive ? new IntPtr(1) : CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                    _triggerActive = false;
+                    if (wasActive)
+                    {
+                        // Release mapped keys
+                        foreach (var vk in _sentMappedKeys.ToArray()) SendKeyRaw((short)vk, true);
+                        _sentMappedKeys.Clear();
+                        // FIX: Re-assert original keys if still held down
+                        foreach (var vk in _physicalKeysDown) SendKeyRaw((short)vk, false);
+                    }
                 }
+                if (wasActive || effectivelyCombat) { UpdateStatus(); return wasActive ? new IntPtr(1) : CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam); }
             }
         }
-
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
-    private static void SendKeyInternal(short vk, bool up)
+    private static void SendKeyRaw(short vk, bool up)
     {
-        if (up) _sentKeys.Remove(vk);
-        else _sentKeys.Add(vk);
-
-        var inputs = new INPUT[]
-        {
-            new INPUT
-            {
-                type = INPUT_KEYBOARD,
-                u = new InputUnion
-                {
-                    ki = new KEYBDINPUT
-                    {
-                        wVk = vk,
-                        dwFlags = up ? KEYEVENTF_KEYUP : 0
-                    }
-                }
-            }
-        };
-
+        var inputs = new INPUT[] { new INPUT { type = INPUT_KEYBOARD, u = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? KEYEVENTF_KEYUP : 0 } } } };
         SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
 }
