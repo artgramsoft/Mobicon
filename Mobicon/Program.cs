@@ -159,7 +159,7 @@ class Program
     }
 
     // State Variables
-    private const string Version = "v1.0.0";
+    private const string Version = "v1.0.1";
     private static LowLevelProc _kbHookProc = KeyboardHookCallback;
     private static LowLevelProc _mHookProc = MouseHookCallback;
     private static IntPtr _kbHook = IntPtr.Zero;
