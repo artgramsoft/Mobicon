@@ -79,7 +79,22 @@ class Program
     [DllImport("user32.dll")]
     private static extern IntPtr DispatchMessage([In] ref MSG lpMsg);
 
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
     // Structs
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct KBDLLHOOKSTRUCT
     {
@@ -284,15 +299,28 @@ class Program
         {
             using var p = Process.GetProcessById((int)pid);
             string currentName = p.ProcessName;
-            bool active = currentName.Equals("MabinogiMobile", StringComparison.OrdinalIgnoreCase);
+            bool isTargetProcess = currentName.Equals("MabinogiMobile", StringComparison.OrdinalIgnoreCase);
+            
+            bool isMouseOver = false;
+            if (isTargetProcess)
+            {
+                if (GetCursorPos(out POINT pt) && GetWindowRect(hWnd, out RECT rect))
+                {
+                    isMouseOver = pt.x >= rect.Left && pt.x <= rect.Right &&
+                                  pt.y >= rect.Top && pt.y <= rect.Bottom;
+                }
+            }
+
+            bool active = isTargetProcess && isMouseOver;
             
             if (active != _lastTargetActive)
             {
                 _lastTargetActive = active;
-                Log($"Active Window Changed: {currentName} (Target: {(active ? "MATCH" : "NO MATCH")})");
+                Log($"Active State Changed: Process={currentName}, MouseOver={isMouseOver} (Result: {(active ? "MATCH" : "NO MATCH")})");
+                
                 if (!active)
                 {
-                    _combatMode = false;
+                    // 전투 모드 토글은 유지하고, 즉각적인 트리거 상태만 해제합니다.
                     _triggerActive = false;
                 }
                 UpdateStatus();
