@@ -83,18 +83,9 @@ class Program
     private static extern bool GetCursorPos(out POINT lpPoint);
 
     [DllImport("user32.dll")]
-    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    private static extern IntPtr WindowFromPoint(POINT Point);
 
     // Structs
-    [StructLayout(LayoutKind.Sequential)]
-    private struct RECT
-    {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-
     [StructLayout(LayoutKind.Sequential)]
     private struct KBDLLHOOKSTRUCT
     {
@@ -178,6 +169,15 @@ class Program
     private static bool _ctrlPressed = false;
     private static bool _lastTargetActive = false;
 
+    // Caching for performance
+    private static IntPtr _lastHWnd = IntPtr.Zero;
+    private static string _lastProcessName = "";
+    private static uint _lastPid = 0;
+    private static DateTime _lastCacheTime = DateTime.MinValue;
+
+    // Key tracking for safety release
+    private static readonly HashSet<int> _sentKeys = new();
+
     private static readonly Dictionary<int, int> KeyMap = new()
     {
         { VK_A, VK_1 },
@@ -214,12 +214,12 @@ class Program
 
         UpdateStatus();
 
-        // Background thread to refresh status (especially process active state)
+        // Background thread to refresh status (periodically checks active state)
         Task.Run(async () =>
         {
             while (true)
             {
-                UpdateStatus();
+                IsTargetActive(); // Keep _lastTargetActive updated
                 await Task.Delay(500);
             }
         });
@@ -237,10 +237,7 @@ class Program
 
     private static void UpdateStatus()
     {
-        bool active = IsTargetActive();
-        
-        // Only update if something changed to reduce flickering/CPU
-        // But we refresh anyway to keep UI responsive
+        bool active = _lastTargetActive;
         
         string status = $" STATUS: [Process: {(active ? "ACTIVE  " : "INACTIVE")}] " +
                         $"[Combat: {(_combatMode ? "ON " : "OFF")}] " +
@@ -270,7 +267,7 @@ class Program
             if (oldTop > 7) Console.SetCursorPosition(oldLeft, oldTop);
             else Console.SetCursorPosition(0, 9);
         }
-        catch { /* Console might be resized or redirected */ }
+        catch { }
     }
 
     private static void Log(string message)
@@ -284,53 +281,85 @@ class Program
             if (oldTop < 9) Console.SetCursorPosition(0, 9);
             
             Console.WriteLine($" [{DateTime.Now:HH:mm:ss}] {message}");
-            UpdateStatus(); // Refresh status line whenever we log
+            UpdateStatus();
         }
         catch { }
     }
 
     private static bool IsTargetActive()
     {
-        IntPtr hWnd = GetForegroundWindow();
-        if (hWnd == IntPtr.Zero) return false;
+        IntPtr fgWnd = GetForegroundWindow();
+        if (fgWnd == IntPtr.Zero) return SetActiveState(false);
 
-        GetWindowThreadProcessId(hWnd, out uint pid);
-        try
+        // Performance: Cache process name by HWnd
+        string procName;
+        if (fgWnd == _lastHWnd && (DateTime.Now - _lastCacheTime).TotalSeconds < 2)
         {
-            using var p = Process.GetProcessById((int)pid);
-            string currentName = p.ProcessName;
-            bool isTargetProcess = currentName.Equals("MabinogiMobile", StringComparison.OrdinalIgnoreCase);
-            
-            bool isMouseOver = false;
-            if (isTargetProcess)
+            procName = _lastProcessName;
+        }
+        else
+        {
+            GetWindowThreadProcessId(fgWnd, out uint pid);
+            _lastHWnd = fgWnd;
+            _lastPid = pid;
+            try
             {
-                if (GetCursorPos(out POINT pt) && GetWindowRect(hWnd, out RECT rect))
+                using var p = Process.GetProcessById((int)pid);
+                procName = p.ProcessName;
+            }
+            catch { procName = ""; }
+            _lastProcessName = procName;
+            _lastCacheTime = DateTime.Now;
+        }
+
+        bool isTargetProcess = procName.Equals("MabinogiMobile", StringComparison.OrdinalIgnoreCase);
+        if (!isTargetProcess) return SetActiveState(false);
+
+        // Click-through prevention: Verify window under cursor belongs to target process
+        bool isMouseOver = false;
+        if (GetCursorPos(out POINT pt))
+        {
+            IntPtr wndAtPt = WindowFromPoint(pt);
+            if (wndAtPt != IntPtr.Zero)
+            {
+                GetWindowThreadProcessId(wndAtPt, out uint pidAtPt);
+                if (pidAtPt == _lastPid)
                 {
-                    isMouseOver = pt.x >= rect.Left && pt.x <= rect.Right &&
-                                  pt.y >= rect.Top && pt.y <= rect.Bottom;
+                    isMouseOver = true;
                 }
             }
+        }
 
-            bool active = isTargetProcess && isMouseOver;
-            
-            if (active != _lastTargetActive)
-            {
-                _lastTargetActive = active;
-                Log($"Active State Changed: Process={currentName}, MouseOver={isMouseOver} (Result: {(active ? "MATCH" : "NO MATCH")})");
-                
-                if (!active)
-                {
-                    // 전투 모드 토글은 유지하고, 즉각적인 트리거 상태만 해제합니다.
-                    _triggerActive = false;
-                }
-                UpdateStatus();
-            }
-            return active;
-        }
-        catch
+        return SetActiveState(isTargetProcess && isMouseOver);
+    }
+
+    private static bool SetActiveState(bool active)
+    {
+        if (active != _lastTargetActive)
         {
-            return false;
+            _lastTargetActive = active;
+            // Log($"Active State: {(active ? "MATCH" : "NO MATCH")}");
+            
+            if (!active)
+            {
+                _triggerActive = false;
+                ReleaseAllKeys(); // Fix Key Sticking
+            }
+            UpdateStatus();
         }
+        return active;
+    }
+
+    private static void ReleaseAllKeys()
+    {
+        if (_sentKeys.Count == 0) return;
+        
+        var keys = _sentKeys.ToArray();
+        foreach (var vk in keys)
+        {
+            SendKeyInternal((short)vk, true);
+        }
+        _sentKeys.Clear();
     }
 
     private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -343,20 +372,13 @@ class Program
             bool isKeyDown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             bool isKeyUp = msg == WM_KEYUP || msg == WM_SYSKEYUP;
             
-            // DEBUG: Tab 키 누를 때 활성 프로세스 로그 출력
             if (vkCode == VK_TAB && isKeyDown)
             {
-                IntPtr hWnd = GetForegroundWindow();
-                GetWindowThreadProcessId(hWnd, out uint pid);
-                string procName = "Unknown";
-                try { using var p = Process.GetProcessById((int)pid); procName = p.ProcessName; } catch { }
-                
-                Log($"Tab Pressed. Active Process: {procName}");
-                
                 if (IsTargetActive())
                 {
                     _combatMode = !_combatMode;
-                    Log($"Combat Mode Toggle: {(_combatMode ? "ON" : "OFF")}");
+                    // Log($"Combat Mode: {(_combatMode ? "ON" : "OFF")}");
+                    if (!_combatMode) ReleaseAllKeys();
                     UpdateStatus();
                     return new IntPtr(1);
                 }
@@ -372,15 +394,19 @@ class Program
                 bool oldCtrl = _ctrlPressed;
                 if (isKeyDown) _ctrlPressed = true;
                 if (isKeyUp) _ctrlPressed = false;
-                if (oldCtrl != _ctrlPressed) UpdateStatus();
+                if (oldCtrl != _ctrlPressed) 
+                {
+                    if (_ctrlPressed) ReleaseAllKeys();
+                    UpdateStatus();
+                }
             }
 
             bool effectivelyCombat = _combatMode && !_ctrlPressed;
 
             if (effectivelyCombat && _triggerActive && KeyMap.ContainsKey(vkCode))
             {
-                if (isKeyDown) SendKey((short)KeyMap[vkCode], false);
-                else if (isKeyUp) SendKey((short)KeyMap[vkCode], true);
+                if (isKeyDown) SendKeyInternal((short)KeyMap[vkCode], false);
+                else if (isKeyUp) SendKeyInternal((short)KeyMap[vkCode], true);
                 return new IntPtr(1);
             }
         }
@@ -416,8 +442,10 @@ class Program
                 _triggerActive = false;
                 if (effectivelyCombat || wasActive)
                 {
+                    ReleaseAllKeys();
                     UpdateStatus();
-                    return new IntPtr(1);
+                    // If we intercepted the down, we must intercept the up
+                    return wasActive ? new IntPtr(1) : CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
                 }
             }
         }
@@ -425,8 +453,11 @@ class Program
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
-    private static void SendKey(short vk, bool up)
+    private static void SendKeyInternal(short vk, bool up)
     {
+        if (up) _sentKeys.Remove(vk);
+        else _sentKeys.Add(vk);
+
         var inputs = new INPUT[]
         {
             new INPUT
