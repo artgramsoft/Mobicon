@@ -159,6 +159,7 @@ class Program
     }
 
     // State Variables
+    private const string Version = "v1.0.0";
     private static LowLevelProc _kbHookProc = KeyboardHookCallback;
     private static LowLevelProc _mHookProc = MouseHookCallback;
     private static IntPtr _kbHook = IntPtr.Zero;
@@ -203,13 +204,14 @@ class Program
 
         Console.Clear();
         Console.WriteLine("==================================================");
-        Console.WriteLine(" Mobicon - Combat Input Mapper");
+        Console.WriteLine($" Mobicon {Version} - Combat Input Mapper");
         Console.WriteLine("==================================================");
         Console.WriteLine(" Target: MabinogiMobile.exe");
         Console.WriteLine(" TAB: Toggle Combat Mode | CTRL: Temp Disable");
         Console.WriteLine(" Mouse Left: Trigger (In Combat Mode)");
+        Console.WriteLine(" Press [Ctrl + C] to Exit Safely");
         Console.WriteLine("==================================================");
-        Console.WriteLine(); // Reserved for status line (Line 7)
+        Console.WriteLine(); // Reserved for status line (Line 8)
         Console.WriteLine(" [LOGS]");
 
         UpdateStatus();
