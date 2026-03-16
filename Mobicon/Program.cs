@@ -266,7 +266,7 @@ internal readonly struct AppState
 // ─────────────────────────────────────────────
 class Program
 {
-    public const string Version = "v1.0.3";
+    public const string Version = "v1.0.4";
 
     // ── Key mapping ──
     private static readonly IReadOnlyDictionary<int, int> KeyMap =
@@ -291,8 +291,12 @@ class Program
     private static bool _ctrlPressed   = false;
     private static bool _targetActive  = false;
 
-    private static readonly HashSet<int> _sentMappedKeys  = new();
-    private static readonly HashSet<int> _physicalKeysDown = new();
+    private static readonly HashSet<int> _sentMappedKeys   = new();
+    private static readonly HashSet<int> _physicalKeysDown  = new();
+
+    // 트리거 ON 시점에 이미 눌려있던 물리 키 스냅샷.
+    // 이 키들은 트리거 활성 중에도 매핑 대상에서 제외하고 원본 이벤트를 그대로 통과시킨다.
+    private static readonly HashSet<int> _keysDownAtTrigger = new();
 
     // ── Public snapshot for UI ──
     public static AppState State => new()
@@ -411,6 +415,7 @@ class Program
         _triggerActive = false;
         foreach (int vk in _sentMappedKeys) SendKey((short)vk, keyUp: true);
         _sentMappedKeys.Clear();
+        _keysDownAtTrigger.Clear();
     }
 
     private static void SendKey(short vk, bool keyUp)
@@ -491,11 +496,21 @@ class Program
             return Win32.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
         }
 
-        // 전투 모드에서 매핑 키 처리
+        // 전투 모드 매핑 처리
         lock (_lock)
         {
             if (_combatMode && !_ctrlPressed && _triggerActive && KeyMap.TryGetValue(vk, out int mapped))
             {
+                if (_keysDownAtTrigger.Contains(vk))
+                {
+                    // 트리거 ON 시점에 이미 눌려있던 키:
+                    //   keyUp이 올 때 제외 목록에서 제거하고 원본 이벤트를 통과시킨다.
+                    //   이후 같은 키를 다시 누르면 제외 목록에 없으므로 매핑이 정상 적용된다.
+                    if (isUp) _keysDownAtTrigger.Remove(vk);
+                    return Win32.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam); // 원본 통과
+                }
+
+                // 트리거 ON 이후 새로 누른 키 → 매핑 적용
                 if (isDown) { _sentMappedKeys.Add(mapped);    SendKey((short)mapped, keyUp: false); }
                 else if (isUp) { _sentMappedKeys.Remove(mapped); SendKey((short)mapped, keyUp: true);  }
                 return new IntPtr(1); // 원본 키 이벤트 소비
@@ -522,24 +537,10 @@ class Program
             lock (_lock)
             {
                 _triggerActive = true;
-
-                // 마우스 DOWN 시점에 이미 눌려 있는 물리 키 처리:
-                //   ① 게임에 전달되고 있던 물리 keyDown을 먼저 올려서(keyUp) 이동을 멈추고
-                //   ② 대응하는 매핑 키를 keyDown으로 주입해 스킬로 전환한다.
-                //
-                // 주입한 물리 keyUp은 LLKHF_INJECTED라 훅을 통과하므로
-                // _physicalKeysDown을 직접 비워서 상태를 일치시킨다.
-                // (물리 keyUp이 나중에 다시 오면 훅이 Remove를 시도하지만 이미 없으므로 무해하다.)
-                var keysToTransition = _physicalKeysDown.Where(k => KeyMap.ContainsKey(k)).ToList();
-                foreach (int vk in keysToTransition)
-                {
-                    int mapped = KeyMap[vk];
-                    SendKey((short)vk,     keyUp: true);   // ① 이동 키 해제 주입
-                    SendKey((short)mapped, keyUp: false);  // ② 스킬 키 주입
-                    _sentMappedKeys.Add(mapped);
-                }
-                // 주입된 keyUp과 상태를 동기화
-                _physicalKeysDown.ExceptWith(keysToTransition);
+                // 트리거 ON 시점에 이미 눌려있던 키를 스냅샷으로 저장한다.
+                // 이 키들은 트리거 활성 중에도 매핑하지 않고 원본 이동 키로 유지한다.
+                _keysDownAtTrigger.Clear();
+                _keysDownAtTrigger.UnionWith(_physicalKeysDown);
             }
             ConsoleUI.UpdateStatus(State);
             return new IntPtr(1); // 클릭 이벤트 소비
