@@ -18,16 +18,21 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '7.0.x'
+          dotnet-version: '10.0.x'
 
-      - name: Build Single-File Executable
+      - name: Build Framework-Dependent (Ultra Light)
         run: |
-          dotnet publish Mobicon/Mobicon.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=true -p:IncludeNativeLibrariesForSelfExtract=true -o ./publish
+          dotnet publish Mobicon/Mobicon.csproj -c Release -o ./publish
+
+      - name: Compress Release Folder
+        shell: pwsh
+        run: |
+          Compress-Archive -Path ./publish/* -DestinationPath ./Mobicon-${{ github.ref_name }}.zip
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: ./publish/Mobicon.exe
+          files: ./Mobicon-${{ github.ref_name }}.zip
           name: Mobicon ${{ github.ref_name }}
           draft: false
           prerelease: false
